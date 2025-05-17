@@ -10,8 +10,11 @@ services:
       - .env  
     environment:
       - TZ=Asia/Shanghai # 中国时区
-     # - HTTP_PROXY=http://127.0.0.1:7890  # 代理地址，请注意！无外网环境需要取消注释，添加自己的代理地址
-     # - HTTPS_PROXY=http://127.0.0.1:7890  # 同上，保持一样就行
+      - ENABLE_STORAGE=true #数据持久化
+     # - HTTP_PROXY=http://host.docker.internal:7890  # 代理地址，请注意！无外网环境需要取消注释，添加自己的代理地址
+     # - HTTPS_PROXY=https://host.docker.internal:7890  # 同上，保持一样就行，电脑部署推荐使用host.docker.internal
+    volumes: # 持久化挂载，自动创建
+      - ./settings:/hajimi/settings
     restart: unless-stopped # 自动重启，但手动停止后不再重启
 
   # 🆙 自动更新监控服务（默认每小时检查一次）

@@ -2,7 +2,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from app.models import ErrorResponse
+from fastapi.middleware.cors import CORSMiddleware
+from app.models.schemas import ErrorResponse
 from app.services import GeminiClient
 from app.utils import (
     APIKeyManager, 
@@ -22,8 +23,6 @@ from app.config.safety import SAFETY_SETTINGS, SAFETY_SETTINGS_G2
 import asyncio
 import sys
 import pathlib
-import threading
-from concurrent.futures import ThreadPoolExecutor
 import os
 # 设置模板目录
 BASE_DIR = pathlib.Path(__file__).parent
@@ -31,11 +30,21 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app = FastAPI(limit="50M")
 
+# --------------- CORS 中间件 ---------------
+# 如果 ALLOWED_ORIGINS 为空列表，则不允许任何跨域请求
+if settings.ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 # --------------- 全局实例 ---------------
 load_settings()
 # 初始化API密钥管理器
 key_manager = APIKeyManager()
-current_api_key = key_manager.get_available_key()
 
 # 创建全局缓存字典，将作为缓存管理器的内部存储
 response_cache = {}
@@ -56,85 +65,61 @@ active_requests_manager = ActiveRequestsManager(requests_pool=active_requests_po
 SKIP_CHECK_API_KEY = os.environ.get("SKIP_CHECK_API_KEY", "").lower() == "true"
 
 # --------------- 工具函数 ---------------
-
-def switch_api_key():
-    global current_api_key
-    key = key_manager.get_available_key() # get_available_key 会处理栈的逻辑
-    if key:
-        current_api_key = key
-        log('info', f"API key 替换为 → {current_api_key[:8]}...", extra={'key': current_api_key[:8], 'request_type': 'switch_key'})
-    else:
-        log('error', "API key 替换失败，所有API key都已尝试，请重新配置或稍后重试", extra={'key': 'N/A', 'request_type': 'switch_key', 'status_code': 'N/A'})
-
-async def check_key(key):
-    """检查单个API密钥是否有效"""
-    is_valid = await test_api_key(key)
-    status_msg = "有效" if is_valid else "无效"
-    log('info', f"API Key {key[:10]}... {status_msg}.")
-    return key if is_valid else None
-
-def check_key_in_thread(key):
-    """在线程中检查单个API密钥的有效性"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        is_valid = loop.run_until_complete(test_api_key(key))
-        if is_valid:
-            # 密钥有效，添加到可用列表
-            key_manager.api_keys.append(key)
-            key_manager._reset_key_stack()
-            log('info', f"API Key {key[:8]}... 有效，已添加到可用列表")
-        else:
-            log('warning', f"API Key {key[:8]}... 无效")
-    finally:
-        loop.close()
-
-def check_key_in_thread_with_invalid(key, invalid_keys_list):
-    """在线程中检查单个API密钥的有效性并收集无效密钥"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        is_valid = loop.run_until_complete(test_api_key(key))
-        if is_valid:
-            # 密钥有效，添加到可用列表
-            key_manager.api_keys.append(key)
-            key_manager._reset_key_stack()
-            log('info', f"API Key {key[:8]}... 有效，已添加到可用列表")
-        else:
-            # 密钥无效，添加到无效列表
-            invalid_keys_list.append(key)
-            log('warning', f"API Key {key[:8]}... 无效，已添加到无效列表")
-    finally:
-        loop.close()
-
-async def check_keys():
-    """启动线程池来并行检查所有密钥"""
-    if SKIP_CHECK_API_KEY:
-        return key_manager.api_keys
-
-    # 保存原始密钥列表的副本
-    all_keys = key_manager.api_keys.copy()
-    # 清空当前密钥列表，将在检查过程中逐个添加有效密钥
-    key_manager.api_keys = []
+# @app.middleware("http")
+# async def log_requests(request: Request, call_next):
+#     """
+#     DEBUG用，接收并打印请求内容
+#     """
+#     log('info', f"接收到请求: {request.method} {request.url}")
+#     try:
+#         body = await request.json()
+#         log('info', f"请求体: {body}")
+#     except Exception:
+#         log('info', "请求体不是 JSON 格式或者为空")
     
-    log('info', f"开始在单独线程中检查 {len(all_keys)} 个API密钥...")
-    
-    # 创建线程池
-    with ThreadPoolExecutor(max_workers=min(10, len(all_keys))) as executor:
-        # 提交所有密钥检查任务
-        future_to_key = {executor.submit(check_key_in_thread, key): key for key in all_keys}
+#     response = await call_next(request)
+#     return response
+
+async def check_remaining_keys_async(keys_to_check: list, initial_invalid_keys: list):
+    """
+    在后台异步检查剩余的 API 密钥。
+    """
+    local_invalid_keys = []
+    found_valid_keys =False
+
+    log('info', f" 开始在后台检查剩余 API Key 是否有效")
+    for key in keys_to_check:
+        is_valid = await test_api_key(key)
+        if is_valid:
+            if key not in key_manager.api_keys: # 避免重复添加
+                key_manager.api_keys.append(key)
+                found_valid_keys = True
+            # log('info', f"API Key {key[:8]}... 有效")
+        else:
+            local_invalid_keys.append(key)
+            log('warning', f" API Key {key[:8]}... 无效")
         
-        # 等待所有任务完成
-        for future in future_to_key:
-            try:
-                future.result()  # 获取结果但不需要处理，因为check_key_in_thread已经处理了有效密钥
-            except Exception as exc:
-                log('error', f"检查密钥时发生错误: {exc}")
-    
-    if not key_manager.api_keys:
-        log('error', "没有可用的 API 密钥！如果您不使用ai studio 请忽略这些错误", extra={'key': 'N/A', 'request_type': 'startup', 'status_code': 'N/A'})
-    
-    return key_manager.api_keys
+        await asyncio.sleep(0.05) # 短暂休眠，避免请求过于密集
+
+    if found_valid_keys:
+        key_manager._reset_key_stack() # 如果找到新的有效key，重置栈
+
+    # 合并所有无效密钥 (初始无效 + 后台检查出的无效)
+    combined_invalid_keys = list(set(initial_invalid_keys + local_invalid_keys))
+
+    # 获取当前设置中的无效密钥
+    current_invalid_keys_str = settings.INVALID_API_KEYS or ""
+    current_invalid_keys_set = set(k.strip() for k in current_invalid_keys_str.split(',') if k.strip())
+
+    # 更新无效密钥集合
+    new_invalid_keys_set = current_invalid_keys_set.union(set(combined_invalid_keys))
+
+    # 只有当无效密钥列表发生变化时才保存
+    if new_invalid_keys_set != current_invalid_keys_set:
+        settings.INVALID_API_KEYS = ','.join(sorted(list(new_invalid_keys_set)))
+        save_settings()
+
+    log('info', f"密钥检查任务完成。当前总可用密钥数量: {len(key_manager.api_keys)}")
 
 # 设置全局异常处理
 sys.excepthook = handle_exception
@@ -143,118 +128,66 @@ sys.excepthook = handle_exception
 
 @app.on_event("startup")
 async def startup_event():
-    log('info', "Starting Gemini API proxy...")
-    await check_version()
+    
     init_vertex_ai()
-    log('info', "初始化Vertex AI")
     schedule_cache_cleanup(response_cache_manager, active_requests_manager)
     # 检查版本
     await check_version()
     load_settings()
     
-    # 先同步检查一个密钥，用于加载可用模型
-    all_keys = key_manager.api_keys.copy()
-    key_manager.api_keys = []  # 清空当前密钥列表
-    
-    # 无效密钥列表
-    invalid_keys = []
-    
-    # 尝试找到一个有效的密钥
-    valid_key_found = False
-    for key in all_keys:
+    # 密钥检查 
+    initial_keys = key_manager.api_keys.copy()
+    key_manager.api_keys = [] # 清空，等待检查结果
+    first_valid_key = None
+    initial_invalid_keys = []
+    keys_to_check_later = []
+
+    # 阻塞式查找第一个有效密钥
+    for index, key in enumerate(initial_keys):
         is_valid = await test_api_key(key)
         if is_valid:
-            key_manager.api_keys.append(key)
+            log('info', f"找到第一个有效密钥: {key[:8]}...")
+            first_valid_key = key
+            key_manager.api_keys.append(key) # 添加到管理器
             key_manager._reset_key_stack()
-            log('info', f"初始检查: API Key {key[:8]}... 有效，已添加到可用列表")
-            valid_key_found = True
-            
-            # 使用这个有效密钥加载可用模型
-            try:
-                all_models = await GeminiClient.list_available_models(key)
-                GeminiClient.AVAILABLE_MODELS = [model.replace(
-                    "models/", "") for model in all_models]
-                log('info', "Available models loaded.")
-            except Exception as e:
-                log('warning', f"无法加载可用模型: {str(e)}")
-            
-            break  # 找到一个有效密钥后就跳出循环
+            # 将剩余的key放入后台检查列表
+            keys_to_check_later = initial_keys[index + 1:]
+            break # 找到即停止
         else:
-            # 将无效密钥添加到无效列表
-            invalid_keys.append(key)
-            log('warning', f"初始检查: API Key {key[:8]}... 无效，已添加到无效列表")
+            log('warning', f"密钥 {key[:8]}... 无效")
+            initial_invalid_keys.append(key)
     
-    if not valid_key_found:
-        log('warning', "初始检查未找到有效密钥，将在后台继续检查")
-    
+    if not first_valid_key:
+        log('error', "启动时未能找到任何有效 API 密钥！")
+        keys_to_check_later = [] # 没有有效key，无需后台检查
+    else:
+        # 使用第一个有效密钥加载模型
+        try:
+            all_models = await GeminiClient.list_available_models(first_valid_key)
+            GeminiClient.AVAILABLE_MODELS = [model.replace("models/", "") for model in all_models]
+            log('info', f"使用密钥 {first_valid_key[:8]}... 加载可用模型成功")
+        except Exception as e:
+            log('warning', f"使用密钥 {first_valid_key[:8]}... 加载可用模型失败",extra={'error_message': str(e)})
+
     if not SKIP_CHECK_API_KEY:
-        # 在后台线程中检查剩余的密钥
-        remaining_keys = [k for k in all_keys if k not in key_manager.api_keys and k not in invalid_keys]
-        if remaining_keys:
-            def check_remaining_keys():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    # 创建收集无效密钥的列表
-                    thread_invalid_keys = []
-                    
-                    # 创建线程池检查剩余密钥
-                    with ThreadPoolExecutor(max_workers=min(10, len(remaining_keys))) as executor:
-                        # 修改为使用自定义函数处理无效密钥
-                        future_to_key = {executor.submit(check_key_in_thread_with_invalid, key, thread_invalid_keys): key for key in remaining_keys}
-                        for future in future_to_key:
-                            try:
-                                future.result()
-                            except Exception as exc:
-                                log('error', f"检查密钥时发生错误: {exc}")
-                    
-                    # 合并所有无效密钥
-                    if thread_invalid_keys:
-                        # 将已有的无效密钥添加进来
-                        current_invalid_keys = settings.INVALID_API_KEYS.split(',') if settings.INVALID_API_KEYS else []
-                        current_invalid_keys = [k.strip() for k in current_invalid_keys if k.strip()]
-                        
-                        # 合并无效密钥列表
-                        all_invalid_keys = list(set(current_invalid_keys + invalid_keys + thread_invalid_keys))
-                        settings.INVALID_API_KEYS = ','.join(all_invalid_keys)
-                        
-                        # 保存设置
-                        save_settings()
-                        log('info', f"更新无效密钥列表，共有 {len(all_invalid_keys)} 个无效密钥")
-                finally:
-                    loop.close()
-                    log('info', f"后台密钥检查完成，当前可用密钥数量: {len(key_manager.api_keys)}")
-            
-            # 启动后台线程检查剩余密钥
-            threading.Thread(target=check_remaining_keys, daemon=True).start()
-            log('info', f"后台线程已启动，正在检查剩余的 {len(remaining_keys)} 个API密钥...")
-    
-    elif valid_key_found:
-        idx = all_keys.index(key_manager.api_keys[-1])
-        key_manager.api_keys += all_keys[idx+1:]
-    
-    # 将初始检查发现的无效密钥添加到INVALID_API_KEYS
-    if invalid_keys:
-        # 获取现有无效密钥
-        current_invalid_keys = settings.INVALID_API_KEYS.split(',') if settings.INVALID_API_KEYS else []
-        current_invalid_keys = [k.strip() for k in current_invalid_keys if k.strip()]
-        
-        # 合并无效密钥列表并去重
-        all_invalid_keys = list(set(current_invalid_keys + invalid_keys))
-        settings.INVALID_API_KEYS = ','.join(all_invalid_keys)
-        log('info', f"更新无效密钥列表，共有 {len(all_invalid_keys)} 个无效密钥")
-    
-    # 保存设置
-    save_settings()
-    
-    if settings.PUBLIC_MODE:
-        settings.MAX_RETRY_NUM = 3
-    
-    # 显示当前可用密钥
-    key_manager.show_all_keys()
-    log('info', f"当前可用 API 密钥数量：{len(key_manager.api_keys)}")
-    log('info', f"最大重试次数设置为：{settings.MAX_RETRY_NUM}")
-    
+        # 创建后台任务检查剩余密钥
+        if keys_to_check_later:
+            asyncio.create_task(check_remaining_keys_async(keys_to_check_later, initial_invalid_keys))
+        else:
+            # 如果没有需要后台检查的key，也要处理初始无效key
+            current_invalid_keys_str = settings.INVALID_API_KEYS or ""
+            current_invalid_keys_set = set(k.strip() for k in current_invalid_keys_str.split(',') if k.strip())
+            new_invalid_keys_set = current_invalid_keys_set.union(set(initial_invalid_keys))
+            if new_invalid_keys_set != current_invalid_keys_set:
+                 settings.INVALID_API_KEYS = ','.join(sorted(list(new_invalid_keys_set)))
+                 save_settings()
+                 log('info', f"更新初始无效密钥列表完成，总无效密钥数: {len(new_invalid_keys_set)}")
+
+    else: # 跳过检查
+        log('info',"跳过 API 密钥检查")
+        key_manager.api_keys.extend(keys_to_check_later)
+        key_manager._reset_key_stack()
+
     # 初始化路由器
     init_router(
         key_manager,
@@ -262,7 +195,7 @@ async def startup_event():
         active_requests_manager,
         SAFETY_SETTINGS,
         SAFETY_SETTINGS_G2,
-        current_api_key,
+        first_valid_key,
         settings.FAKE_STREAMING,
         settings.FAKE_STREAMING_INTERVAL,
         settings.PASSWORD,

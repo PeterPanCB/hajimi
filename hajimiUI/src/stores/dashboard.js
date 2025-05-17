@@ -32,12 +32,14 @@ export const useDashboardStore = defineStore('dashboard', () => {
     increaseConcurrentOnFailure: 0,
     maxConcurrentRequests: 0,
     maxRetryNum: 0,
-    searchPrompt: ''
+    searchPrompt: '',
+    maxEmptyResponses: 0
   })
 
   const apiKeyStats = ref([])
   const logs = ref([])
   const isRefreshing = ref(false)
+  const isConfigLoaded = ref(false)
   
   // 添加模型相关状态
   const selectedModel = ref('all')
@@ -123,7 +125,10 @@ export const useDashboardStore = defineStore('dashboard', () => {
       increaseConcurrentOnFailure: data.increase_concurrent_on_failure || 0,
       maxConcurrentRequests: data.max_concurrent_requests || 0,
       enableVertex: data.enable_vertex || false,
-      maxRetryNum: data.max_retry_num || 0
+      enableVertexExpress: data.enable_vertex_express || false,
+      vertexExpressApiKey: data.vertex_express_api_key || false,
+      maxRetryNum: data.max_retry_num || 0,
+      maxEmptyResponses: data.max_empty_responses || 0
     }
 
     // 更新API密钥统计
@@ -161,6 +166,8 @@ export const useDashboardStore = defineStore('dashboard', () => {
     if (data.logs) {
       logs.value = data.logs
     }
+
+    isConfigLoaded.value = true
   }
   
   // 设置选择的模型
@@ -230,6 +237,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     isDarkMode,
     toggleDarkMode,
     updateConfig,
-    toggleVertex
+    toggleVertex,
+    isConfigLoaded
   }
 })

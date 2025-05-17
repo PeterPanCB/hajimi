@@ -2,7 +2,7 @@ import sys,asyncio
 #from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # 替换为异步调度器
 from app.utils.logging import log
-from app.utils.stats import clean_expired_stats
+from app.utils.stats import api_stats_manager
 from app.utils import check_version
 from zoneinfo import ZoneInfo
 from app.config import settings,persistence
@@ -37,9 +37,38 @@ def schedule_cache_cleanup(response_cache_manager, active_requests_manager):
     scheduler.add_job(response_cache_manager.clean_expired, 'interval', minutes=1)
     scheduler.add_job(active_requests_manager.clean_completed, 'interval', seconds=30)
     scheduler.add_job(active_requests_manager.clean_long_running, 'interval', minutes=5, args=[300])
-    scheduler.add_job(clean_expired_stats, 'interval', minutes=5, args=[settings.api_call_stats])
+    
+    # 使用同步包装器调用异步函数
+    def run_cleanup():
+        try:
+            # 创建新的事件循环而不是获取现有的
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # 在这个新循环中运行清理操作
+            loop.run_until_complete(api_stats_manager.cleanup())
+        except Exception as e:
+            log('error', f"清理统计数据时出错: {str(e)}")
+        finally:
+            # 确保关闭循环以释放资源
+            loop.close()
+    
+    # 添加同步的清理任务
+    scheduler.add_job(run_cleanup, 'interval', minutes=5)
+    
+    # 同样修改定时重置函数
+    def run_reset():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(api_call_stats_clean())
+        except Exception as e:
+            log('error', f"重置统计数据时出错: {str(e)}")
+        finally:
+            loop.close()
+    
     scheduler.add_job(check_version, 'interval', hours=4)
-    scheduler.add_job(api_call_stats_clean, 'cron', hour=15,minute=0) 
+    scheduler.add_job(run_reset, 'cron', hour=15, minute=0)
     scheduler.start()
     return scheduler
 
@@ -47,7 +76,7 @@ async def api_call_stats_clean():
     """
     每天定时重置API调用统计数据
     
-    将settings.api_call_stats重置为初始空结构
+    使用新的统计系统重置
     """
     from app.utils.logging import log
     
@@ -55,20 +84,11 @@ async def api_call_stats_clean():
         # 记录重置前的状态
         log('info', "开始重置API调用统计数据")
         
-        # 创建一个全新的空结构
-        new_stats = {
-            'calls': []  # 存储每次调用的记录，每个记录包含 api_key, model, timestamp, tokens
-        }
+        # 使用新的统计系统重置
+        await api_stats_manager.reset()
         
-        # 使用深拷贝确保完全替换原结构
-        settings.api_call_stats = copy.deepcopy(new_stats)
-        
-        # 验证重置是否成功
-        if len(settings.api_call_stats['calls']) == 0:
-            log('info', "API调用统计数据已成功重置")
-            persistence.save_settings()
-        else:
-            log('error', "API调用统计数据重置可能未完全成功")
+        log('info', "API调用统计数据已成功重置")
+        persistence.save_settings()
             
     except Exception as e:
         log('error', f"重置API调用统计数据时发生错误: {str(e)}")

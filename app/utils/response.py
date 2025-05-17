@@ -31,6 +31,30 @@ def openAI_from_text(model="gemini",content=None,finish_reason=None,total_token_
         formatted_chunk["object"] = "chat.completion"
         return formatted_chunk
 
+def gemini_from_text(content=None, finish_reason=None, total_token_count=0, stream=True): 
+    """
+    根据传入参数，创建 Gemini API 标准响应对象块 (GenerateContentResponse 格式)。
+    """
+    gemini_response = {
+        "candidates": {
+            "index": 0,
+            "content": {
+                "parts": [],
+                "role": "model"
+            }
+        }
+    }
+    if content:
+        gemini_response["candidates"]["content"]["parts"].append({"text": content})
+    
+    if finish_reason:
+        gemini_response["usageMetadata"]= {"totalTokenCount": total_token_count}
+    
+    if stream:
+        return f"data: {json.dumps(gemini_response, ensure_ascii=False)}\n\n"
+    else:
+        return gemini_response
+
 
 def openAI_from_Gemini(response,stream=True):
     """
@@ -58,9 +82,9 @@ def openAI_from_Gemini(response,stream=True):
     total_tokens_raw = getattr(response, 'total_token_count', None)
 
     usage_data = {
-        "prompt_tokens": int(prompt_tokens_raw) if prompt_tokens_raw is not None else 0,
-        "completion_tokens": int(candidates_tokens_raw) if candidates_tokens_raw is not None else 0,
-        "total_tokens": int(total_tokens_raw) if total_tokens_raw is not None else 0
+        "prompt_tokens": int(prompt_tokens_raw) if prompt_tokens_raw else 0,
+        "completion_tokens": int(candidates_tokens_raw) if candidates_tokens_raw else 0,
+        "total_tokens": int(total_tokens_raw) if total_tokens_raw else 0
     }
 
     if response.function_call:
@@ -96,13 +120,11 @@ def openAI_from_Gemini(response,stream=True):
         # 仅在流结束时添加 usage 字段
         if response.finish_reason:
             formatted_chunk["usage"] = usage_data
+        return f"data: {json.dumps(formatted_chunk, ensure_ascii=False)}\n\n"
+    
     else:
         formatted_chunk["choices"][0]["message"] = content_chunk
         formatted_chunk["object"] = "chat.completion"
         # 非流式响应总是包含 usage 字段，以满足 response_model 验证
         formatted_chunk["usage"] = usage_data
-
-    if stream:
-        return f"data: {json.dumps(formatted_chunk, ensure_ascii=False)}\n\n"
-    else:
         return formatted_chunk

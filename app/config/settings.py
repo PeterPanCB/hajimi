@@ -26,7 +26,8 @@ RANDOM_STRING_LENGTH = int(os.environ.get("RANDOM_STRING_LENGTH", "5"))
 # 是否启用Vertex AI
 ENABLE_VERTEX = os.environ.get("ENABLE_VERTEX", "false").lower() in ["true", "1", "yes"]
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-
+ENABLE_VERTEX_EXPRESS = os.environ.get("ENABLE_VERTEX_EXPRESS", "false").lower() in ["true", "1", "yes"]
+VERTEX_EXPRESS_API_KEY = os.environ.get("VERTEX_EXPRESS_API_KEY", None)
 # 日志配置
 logging.getLogger("uvicorn").disabled = True
 logging.getLogger("uvicorn.access").disabled = True
@@ -53,6 +54,7 @@ API_KEY_DAILY_LIMIT = int(os.environ.get("API_KEY_DAILY_LIMIT", "100"))
 CACHE_EXPIRY_TIME = int(os.environ.get("CACHE_EXPIRY_TIME", "21600"))  # 默认缓存 6 小时 (21600 秒)
 MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "500"))  # 默认最多缓存500条响应
 PRECISE_CACHE = os.environ.get("PRECISE_CACHE", "false").lower() in ["true", "1", "yes"] #是否取所有消息来算缓存键
+CALCULATE_CACHE_ENTRIES = int(os.environ.get("CALCULATE_CACHE_ENTRIES", "6"))  # 默认取最后 6 条消息算缓存键
 
 search={
     "search_mode":os.environ.get("SEARCH_MODE", "false").lower() in ["true", "1", "yes"],
@@ -66,8 +68,10 @@ version={
 }
 
 # API调用统计
+# 这个对象保留为空结构以保持向后兼容性
+# 实际统计数据已迁移到 app/utils/stats.py 中的 ApiStatsManager 类
 api_call_stats = {
-    'calls': []  # 存储每次调用的记录，每个记录包含 api_key, model, timestamp, tokens
+    'calls': []  # 兼容旧版代码结构
 }
 
 # 用于保护 api_call_stats 并发访问的锁
@@ -90,3 +94,8 @@ DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
 WHITELIST_MODELS = { x.strip() for x in os.environ.get("WHITELIST_MODELS", "").split(",") if x.strip() }
 # 白名单User-Agent
 WHITELIST_USER_AGENT = { x.strip().lower() for x in os.environ.get("WHITELIST_USER_AGENT", "").split(",") if x.strip() }
+
+# 跨域配置
+# 允许的源列表，逗号分隔，例如 "http://localhost:3000,https://example.com"
+ALLOWED_ORIGINS_STR = os.environ.get("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]

@@ -16,6 +16,16 @@ from app.utils.auth import verify_web_password
 from app.utils.maintenance import api_call_stats_clean
 from app.utils.logging import log, vertex_log_manager
 from app.config.persistence import save_settings
+from app.utils.stats import api_stats_manager
+from typing import List
+import json
+
+# Import necessary components for Google Credentials JSON update
+from app.vertex.vertex import credential_manager as global_credential_manager, \
+    parse_multiple_json_credentials, \
+    init_vertex_ai as re_init_vertex_ai_function, \
+    reset_global_fallback_client
+
 # 创建路由器
 dashboard_router = APIRouter(prefix="/api", tags=["dashboard"])
 
@@ -46,105 +56,39 @@ def init_dashboard_router(
     active_requests_manager = active_req_mgr
     return dashboard_router
 
+async def run_blocking_init_vertex():
+    """Helper to run the blocking init_vertex_ai function in an executor."""
+    loop = asyncio.get_event_loop()
+    try:
+        success = await loop.run_in_executor(None, re_init_vertex_ai_function)
+        if success:
+            log('info', "异步重新执行 init_vertex_ai 成功，以响应 Google Credentials JSON 的更新。")
+        else:
+            log('warning', "异步重新执行 init_vertex_ai 失败或未完成，在 Google Credentials JSON 更新后。")
+    except Exception as e:
+        log('error', f"执行 run_blocking_init_vertex 时出错: {e}")
+
 @dashboard_router.get("/dashboard-data")
 async def get_dashboard_data():
     """获取仪表盘数据的API端点，用于动态刷新"""
     # 先清理过期数据，确保统计数据是最新的
-    clean_expired_stats(settings.api_call_stats)
-    response_cache_manager.clean_expired()  # 使用管理器清理缓存
+    await api_stats_manager.maybe_cleanup()
+    await response_cache_manager.clean_expired()  # 使用管理器清理缓存
     active_requests_manager.clean_completed()  # 使用管理器清理活跃请求
     
     # 获取当前统计数据
     now = datetime.now()
     
-    # 计算过去24小时的调用总数
-    last_24h_calls = len(settings.api_call_stats['calls'])
+    # 使用新的统计系统获取调用数据
+    last_24h_calls = api_stats_manager.get_calls_last_24h()
+    hourly_calls = api_stats_manager.get_calls_last_hour(now)
+    minute_calls = api_stats_manager.get_calls_last_minute(now)
     
-    # 计算过去一小时内的调用总数
-    one_hour_ago = now - timedelta(hours=1)
-    hourly_calls = sum(1 for call in settings.api_call_stats['calls'] 
-                      if call['timestamp'] >= one_hour_ago)
-    
-    # 计算过去一分钟内的调用总数
-    one_minute_ago = now - timedelta(minutes=1)
-    minute_calls = sum(1 for call in settings.api_call_stats['calls'] 
-                      if call['timestamp'] >= one_minute_ago)
-    
-    # 计算时间序列数据（过去30分钟，每分钟一个数据点）
-    time_series_data = []
-    tokens_time_series = []
-    
-    # 过去30分钟的每分钟API调用统计
-    for i in range(30, -1, -1):
-        minute_start = now - timedelta(minutes=i)
-        minute_end = now - timedelta(minutes=i-1) if i > 0 else now
-        
-        # 这一分钟的调用次数
-        calls_in_minute = sum(1 for call in settings.api_call_stats['calls'] 
-                            if minute_start <= call['timestamp'] < minute_end)
-        
-        # 这一分钟的token使用量
-        tokens_in_minute = sum(call['tokens'] for call in settings.api_call_stats['calls'] 
-                             if minute_start <= call['timestamp'] < minute_end)
-        
-        # 添加到时间序列
-        time_series_data.append({
-            'time': minute_start.strftime('%H:%M'),
-            'value': calls_in_minute
-        })
-        
-        tokens_time_series.append({
-            'time': minute_start.strftime('%H:%M'),
-            'value': tokens_in_minute
-        })
+    # 获取时间序列数据
+    time_series_data, tokens_time_series = api_stats_manager.get_time_series_data(30, now)
     
     # 获取API密钥使用统计
-    api_key_stats = []
-    for api_key in key_manager.api_keys:
-        # 获取API密钥前8位作为标识
-        api_key_id = api_key[:8]
-        
-        # 计算24小时内的调用次数、token数和按模型分类的统计
-        calls_24h = 0
-        total_tokens = 0
-        model_stats = {}
-        
-        # 筛选该API密钥的调用记录
-        api_key_calls = [call for call in settings.api_call_stats['calls'] 
-                        if call['api_key'] == api_key]
-        
-        # 按模型分类统计
-        for call in api_key_calls:
-            model = call['model']
-            tokens = call['tokens']
-            
-            calls_24h += 1
-            total_tokens += tokens
-            
-            if model not in model_stats:
-                model_stats[model] = {
-                    'calls': 0,
-                    'tokens': 0
-                }
-            
-            model_stats[model]['calls'] += 1
-            model_stats[model]['tokens'] += tokens
-        
-        # 计算使用百分比
-        usage_percent = (calls_24h / settings.API_KEY_DAILY_LIMIT) * 100 if settings.API_KEY_DAILY_LIMIT > 0 else 0
-        
-        # 添加到结果列表
-        api_key_stats.append({
-            'api_key': api_key_id,
-            'calls_24h': calls_24h,
-            'total_tokens': total_tokens,
-            'limit': settings.API_KEY_DAILY_LIMIT,
-            'usage_percent': round(usage_percent, 2),
-            'model_stats': model_stats  # 现在包含调用次数和token数
-        })
-    
-    # 按使用百分比降序排序
-    api_key_stats.sort(key=lambda x: x['usage_percent'], reverse=True)
+    api_key_stats = api_stats_manager.get_api_key_stats(key_manager.api_keys)
     
     # 根据ENABLE_VERTEX设置决定返回哪种日志
     if settings.ENABLE_VERTEX:
@@ -203,8 +147,14 @@ async def get_dashboard_data():
         "max_concurrent_requests": settings.MAX_CONCURRENT_REQUESTS,
         # 启用vertex
         "enable_vertex": settings.ENABLE_VERTEX,
+        # 添加Vertex Express配置
+        "enable_vertex_express": settings.ENABLE_VERTEX_EXPRESS,
+        "vertex_express_api_key": bool(settings.VERTEX_EXPRESS_API_KEY),  # 只返回是否设置的状态
+        "google_credentials_json": bool(settings.GOOGLE_CREDENTIALS_JSON),  # 只返回是否设置的状态
         # 添加最大重试次数
         "max_retry_num": settings.MAX_RETRY_NUM,
+        # 添加空响应重试次数限制
+        "max_empty_responses": settings.MAX_EMPTY_RESPONSES,
     }
 
 @dashboard_router.post("/reset-stats")
@@ -233,7 +183,7 @@ async def reset_stats(password_data: dict):
             raise HTTPException(status_code=401, detail="密码错误")
         
         # 调用重置函数
-        await api_call_stats_clean()
+        await api_stats_manager.reset()
         
         return {"status": "success", "message": "API调用统计数据已重置"}
     except HTTPException:
@@ -299,6 +249,19 @@ async def update_config(config_data: dict):
                 raise HTTPException(status_code=422, detail="参数类型错误：应为布尔值")
             settings.FAKE_STREAMING = config_value
             log('info', f"假流式请求已更新为：{config_value}")
+            
+        elif config_key == "enable_vertex_express":
+            if not isinstance(config_value, bool):
+                raise HTTPException(status_code=422, detail="参数类型错误：应为布尔值")
+            settings.ENABLE_VERTEX_EXPRESS = config_value
+            log('info', f"Vertex Express已更新为：{config_value}")
+            
+        elif config_key == "vertex_express_api_key":
+            if not isinstance(config_value, str):
+                raise HTTPException(status_code=422, detail="参数类型错误：应为字符串")
+            settings.VERTEX_EXPRESS_API_KEY = config_value
+            log('info', f"Vertex Express API Key已更新")
+            
         elif config_key == "fake_streaming_interval":
             try:
                 value = float(config_value)
@@ -383,6 +346,70 @@ async def update_config(config_data: dict):
                 raise HTTPException(status_code=422, detail="参数类型错误：应为布尔值")
             settings.ENABLE_VERTEX = config_value
             log('info', f"Vertex AI 已更新为：{config_value}")
+
+        elif config_key == "google_credentials_json":
+            if not isinstance(config_value, str): # Allow empty string to clear
+                raise HTTPException(status_code=422, detail="参数类型错误：Google Credentials JSON 应为字符串")
+
+            # Validate JSON structure if not empty
+            if config_value:
+                try:
+                    # Attempt to parse as single or multiple JSONs
+                    # parse_multiple_json_credentials logs errors if parsing fails but returns list.
+                    temp_parsed = parse_multiple_json_credentials(config_value)
+                    # If parse_multiple_json_credentials returns an empty list for a non-empty string,
+                    # it means it didn't find any valid top-level JSON objects as per its logic.
+                    # We can do an additional check for a single valid JSON object.
+                    if not temp_parsed: # and config_value.strip(): # ensure non-empty string before json.loads
+                        try:
+                            # This is a stricter check. If parse_multiple_json_credentials, which is more lenient,
+                            # failed to find anything, and this also fails, then it's likely malformed.
+                            json.loads(config_value) # Try parsing as a single JSON object
+                            # If this succeeds, it implies the string IS a valid single JSON,
+                            # but not in the multi-JSON format parse_multiple_json_credentials might be looking for initially.
+                            # parse_multiple_json_credentials will be called again later and should handle it.
+                        except json.JSONDecodeError:
+                            # This specific error means it's not even a valid single JSON.
+                            raise HTTPException(status_code=422, detail="Google Credentials JSON 格式无效。它既不是有效的单个JSON对象，也不是逗号分隔的多个JSON对象。")
+                except HTTPException: # Re-raise if it's already an HTTPException from inner check
+                    raise
+                except Exception as e: # Catch any other error during this pre-check
+                    # This might catch errors if parse_multiple_json_credentials itself had an unexpected issue
+                    # not related to JSONDecodeError but still an error.
+                    raise HTTPException(status_code=422, detail=f"Google Credentials JSON 预检查失败: {str(e)}")
+
+            settings.GOOGLE_CREDENTIALS_JSON = config_value
+            log('info', "Google Credentials JSON 设置已更新 (内容未记录)。")
+
+            # Reset global fallback client first
+            reset_global_fallback_client()
+
+            # Clear previously loaded JSON string credentials from manager
+            cleared_count = global_credential_manager.clear_json_string_credentials()
+            log('info', f"从 CredentialManager 中清除了 {cleared_count} 个先前由 JSON 字符串加载的凭据。")
+
+            if config_value: # If new JSON string is provided
+                parsed_json_objects = parse_multiple_json_credentials(config_value)
+                if parsed_json_objects:
+                    loaded_count = global_credential_manager.load_credentials_from_json_list(parsed_json_objects)
+                    log('info', f"从更新的 Google Credentials JSON 中加载了 {loaded_count} 个凭据到 CredentialManager。")
+                else:
+                    # This log implies that parse_multiple_json_credentials returned empty for a non-empty string.
+                    # The earlier validation (json.loads) would have caught if it wasn't even a single valid JSON.
+                    # So this means it might be a single valid JSON but not fitting the "multiple" parser's expectation,
+                    # or it was truly empty/invalid and the pre-check logic needs review if that's unexpected here.
+                    # However, load_credentials_from_json_list expects a list of dicts, so if parsed_json_objects is empty,
+                    # it correctly loads zero.
+                    log('info', "更新的 Google Credentials JSON 解析后未产生可加载的多对象列表，或者内容本身无法解析为有效凭据结构，未加载任何新凭据到 CredentialManager。")
+            else:
+                log('info', "Google Credentials JSON 已被清空。CredentialManager 中来自 JSON 字符串的凭据已被移除。")
+            
+            # Save all settings changes
+            save_settings() # Moved save_settings here to ensure it's called for this key
+
+            # Trigger re-initialization of Vertex AI (which can re-init the global client)
+            asyncio.create_task(run_blocking_init_vertex())
+            log('info', "已安排 Vertex AI 服务重新初始化以应用 Google Credentials JSON 更改。")
         
         elif config_key == "max_retry_num":
             try:
@@ -443,6 +470,16 @@ async def update_config(config_data: dict):
             
             log('info', f"已添加 {added_key_count} 个新API密钥，当前共有 {len(key_manager.api_keys)} 个")
                 
+        elif config_key == "max_empty_responses":
+            try:
+                value = int(config_value)
+                if value < 0: # 通常至少为0或1，根据实际需求调整
+                    raise ValueError("空响应重试次数不能为负数")
+                settings.MAX_EMPTY_RESPONSES = value
+                log('info', f"空响应重试次数已更新为：{value}")
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=f"参数类型错误：{str(e)}")
+        
         else:
             raise HTTPException(status_code=400, detail=f"不支持的配置项：{config_key}")
         save_settings()
